@@ -3,6 +3,7 @@ package mustgather
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/klog/v2"
 
 	corev1 "k8s.io/api/core/v1"
@@ -41,7 +43,6 @@ import (
 	"github.com/openshift/library-go/pkg/image/imageutil"
 	imagereference "github.com/openshift/library-go/pkg/image/reference"
 	"github.com/openshift/library-go/pkg/operator/resource/retry"
-
 	"github.com/openshift/oc/pkg/cli/admin/inspect"
 	"github.com/openshift/oc/pkg/cli/rsync"
 	ocmdhelpers "github.com/openshift/oc/pkg/helpers/cmd"
@@ -92,6 +93,8 @@ sleep 5
 done`
 )
 
+const concurrentMG = 4
+
 func NewMustGatherCommand(f kcmdutil.Factory, streams genericiooptions.IOStreams) *cobra.Command {
 	o := NewMustGatherOptions(streams)
 	cmd := &cobra.Command{
@@ -111,6 +114,7 @@ func NewMustGatherCommand(f kcmdutil.Factory, streams genericiooptions.IOStreams
 	cmd.Flags().BoolVar(&o.HostNetwork, "host-network", o.HostNetwork, "Run must-gather pods as hostNetwork: true - relevant if a specific command and image needs to capture host-level data")
 	cmd.Flags().StringSliceVar(&o.Images, "image", o.Images, "Specify a must-gather plugin image to run. If not specified, OpenShift's default must-gather image will be used.")
 	cmd.Flags().StringSliceVar(&o.ImageStreams, "image-stream", o.ImageStreams, "Specify an image stream (namespace/name:tag) containing a must-gather plugin image to run.")
+	cmd.Flags().BoolVar(&o.AllImages, "all-images", o.AllImages, "Collect must-gather using the default image for all Operators on the cluster annotated with \"operators.openshift.io/must-gather-image\"")
 	cmd.Flags().StringVar(&o.DestDir, "dest-dir", o.DestDir, "Set a specific directory on the local machine to write gathered data to.")
 	cmd.Flags().StringVar(&o.SourceDir, "source-dir", o.SourceDir, "Set the specific directory on the pod copy the gathered data from.")
 	cmd.Flags().StringVar(&o.timeoutStr, "timeout", "10m", "The length of time to gather data, like 5s, 2m, or 3h, higher than zero. Defaults to 10 minutes.")
@@ -171,6 +175,10 @@ func (o *MustGatherOptions) Complete(f kcmdutil.Factory, cmd *cobra.Command, arg
 	if len(o.DestDir) == 0 {
 		o.DestDir = fmt.Sprintf("must-gather.local.%06d", rand.Int63())
 	}
+	// TODO: this should be in Validate() method, but added here because of the call to o.completeImages() below
+	if len(o.Images) != 0 && o.AllImages {
+		return fmt.Errorf("--image and --all-images are mutually exclusive: please specify one or the other")
+	}
 	if err := o.completeImages(); err != nil {
 		return err
 	}
@@ -194,7 +202,7 @@ func (o *MustGatherOptions) completeImages() error {
 			return fmt.Errorf("unable to resolve image stream '%v': %v", imageStream, err)
 		}
 	}
-	if len(o.Images) == 0 {
+	if len(o.Images) == 0 || o.AllImages {
 		var image string
 		var err error
 		if image, err = o.resolveImageStreamTag("openshift", "must-gather", "latest"); err != nil {
@@ -203,8 +211,71 @@ func (o *MustGatherOptions) completeImages() error {
 		}
 		o.Images = append(o.Images, image)
 	}
+	if o.AllImages {
+		// find all csvs and clusteroperators with the annotation "operators.openshift.io/must-gather-image"
+		var csvs []byte
+		var cos []byte
+		var err error
+		var csvPath = "/apis/operators.coreos.com/v1alpha1/clusterserviceversions"
+		var coPath = "/apis/config.openshift.io/v1/clusteroperators"
+		var pluginImages = map[string]struct{}{}
+
+		csvs, err = o.Client.Discovery().RESTClient().Get().
+			AbsPath(csvPath).
+			DoRaw(context.TODO())
+		if err != nil {
+			return err
+		}
+		images, err := annotatedOperators(csvs)
+		if err != nil {
+			return err
+		}
+		for k := range images {
+			pluginImages[k] = images[k]
+		}
+
+		cos, err = o.Client.Discovery().RESTClient().Get().
+			AbsPath(coPath).
+			DoRaw(context.TODO())
+		if err != nil {
+			return err
+		}
+		images, err = annotatedOperators(cos)
+		if err != nil {
+			return err
+		}
+		for k := range images {
+			pluginImages[k] = images[k]
+		}
+
+		for i := range pluginImages {
+			o.Images = append(o.Images, i)
+		}
+	}
 	o.log("Using must-gather plug-in image: %s", strings.Join(o.Images, ", "))
 	return nil
+}
+
+func annotatedOperators(data []byte) (map[string]struct{}, error) {
+	var annotation = "operators.openshift.io/must-gather-image"
+	var pluginImages = map[string]struct{}{}
+	var u unstructured.UnstructuredList
+
+	err := json.Unmarshal(data, &u)
+	if err != nil {
+		return map[string]struct{}{}, err
+	}
+
+	for _, item := range u.Items {
+		ann := item.GetAnnotations()
+		if v, ok := ann[annotation]; ok {
+			pluginImages[v] = struct{}{}
+		} else {
+			continue
+		}
+	}
+
+	return pluginImages, nil
 }
 
 func (o *MustGatherOptions) resolveImageStreamTagString(s string) (string, error) {
@@ -256,6 +327,7 @@ type MustGatherOptions struct {
 	DestDir          string
 	SourceDir        string
 	Images           []string
+	AllImages        bool
 	ImageStreams     []string
 	Command          []string
 	Timeout          time.Duration
@@ -298,7 +370,7 @@ func (o *MustGatherOptions) Validate() error {
 	return nil
 }
 
-// Run creates and runs a must-gather pod.d
+// Run creates and runs a must-gather pod
 func (o *MustGatherOptions) Run() error {
 	var errs []error
 
@@ -412,11 +484,16 @@ func (o *MustGatherOptions) Run() error {
 	defer o.logTimestamp()
 
 	var wg sync.WaitGroup
-	wg.Add(len(pods))
+	w := make(chan struct{}, concurrentMG)
 	errCh := make(chan error, len(pods))
 	for _, pod := range pods {
+		w <- struct{}{}
+		wg.Add(1)
 		go func(pod *corev1.Pod) {
-			defer wg.Done()
+			defer func() {
+				<-w
+				wg.Done()
+			}()
 
 			if len(o.RunNamespace) > 0 && !o.Keep {
 				defer func() {
