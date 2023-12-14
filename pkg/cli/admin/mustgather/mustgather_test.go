@@ -16,7 +16,10 @@ import (
 
 	imagev1 "github.com/openshift/api/image/v1"
 	imageclient "github.com/openshift/client-go/image/clientset/versioned/fake"
+	operatorapi "github.com/operator-framework/api/pkg/operators/v1alpha1"
 )
+
+const annotation = "operators.openshift.io/must-gather-image"
 
 func TestImagesAndImageStreams(t *testing.T) {
 
@@ -26,6 +29,7 @@ func TestImagesAndImageStreams(t *testing.T) {
 		imageStreams   []string
 		expectedImages []string
 		objects        []runtime.Object
+		allImages      bool
 	}{
 		{
 			name: "Default",
@@ -65,6 +69,15 @@ func TestImagesAndImageStreams(t *testing.T) {
 				newImageStream("test", "three", withTag("a", "three@a")),
 				newImageStream("test", "four", withTag("a", "four@a")),
 			},
+		},
+		{
+			name:      "AllImagesOnlyCSVs",
+			allImages: true,
+			objects: []runtime.Object{
+				newClusterServiceVersion("csva", "test/csv:a", true),
+				newClusterServiceVersion("csvb", "test/csv:b", false),
+			},
+			expectedImages: []string{"test/csv:a"},
 		},
 	}
 
@@ -108,6 +121,18 @@ func withTag(tag, reference string) func(*imagev1.ImageStream) *imagev1.ImageStr
 		})
 		return imageStream
 	}
+}
+
+func newClusterServiceVersion(name, image string, annotate bool) *operatorapi.ClusterServiceVersion {
+	op := &operatorapi.ClusterServiceVersion{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+	}
+	if annotate {
+		op.Annotations = map[string]string{annotation: image}
+	}
+	return op
 }
 
 func TestGetNamespace(t *testing.T) {
